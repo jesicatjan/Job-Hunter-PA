@@ -1,0 +1,7 @@
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+python-dotenv==1.0.1
+pydantic-settings==2.8.1
+aiogram==3.19.0
+notion-client==2.2.1

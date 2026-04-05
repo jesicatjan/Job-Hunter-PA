@@ -1,0 +1,21 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    host: str = "0.0.0.0"
+    port: int = 8000
+
+    openclaw_api_url: str = "http://localhost:11434/v1/chat/completions"
+    openclaw_api_key: str = ""
+    openclaw_model: str = "openclaw"
+
+    notion_api_key: str = ""
+    notion_database_id: str = ""
+
+    telegram_bot_token: str = ""
+    backend_base_url: str = "http://localhost:8000"
+
+
+settings = Settings()
