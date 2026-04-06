@@ -1,3 +1,7 @@
+from typing import Optional
+import base64
+import binascii
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 import asyncio
@@ -41,18 +45,44 @@ def _split_subject_and_body(text: str) -> tuple[str, str]:
 
 
 def _fallback_outreach_draft(recipient_name: str, role: str, company: str, resume_text: str) -> tuple[str, str]:
+    placeholder_markers = {
+        "please refer to the attached resume pdf for full details.",
+        "resume is available as pdf and can be shared when requested.",
+    }
+    normalized_resume_text = (resume_text or "").strip()
+    include_highlights = bool(normalized_resume_text) and normalized_resume_text.lower() not in placeholder_markers
+
     subject = f"Application Interest: {role} role at {company}"
+    highlights_section = ""
+    if include_highlights:
+        highlights_section = f"Highlights from my profile:\n{normalized_resume_text}\n\n"
+
     body = (
         f"Hi {recipient_name},\n\n"
         f"I hope you are doing well. I am reaching out to express my interest in the {role} role at {company}. "
         "I believe my background is a strong fit for this opportunity.\n\n"
-        "Highlights from my profile:\n"
-        f"{resume_text}\n\n"
+        f"{highlights_section}"
         "I would be grateful for the opportunity to discuss how I can contribute to your team. "
-        "I have attached my resume for your review.\n\n"
-        "Thank you for your time and consideration.\n"
+        "Please find my resume attached for your review.\n\n"
+        "Thank you for your time and consideration."
     )
     return subject, body
+
+
+def _finalize_outreach_body(body: str, sender_full_name: Optional[str] = None) -> str:
+    sender_name = (sender_full_name or "Your Full Name").strip() or "Your Full Name"
+    normalized = body.strip()
+    lower = normalized.lower()
+
+    if "resume attached" not in lower and "find my resume attached" not in lower:
+        normalized += "\n\nPlease find my resume attached for your review."
+
+    if "best regards" not in lower:
+        normalized += f"\n\nBest Regards,\n{sender_name}"
+    elif sender_name.lower() not in lower:
+        normalized += f"\n{sender_name}"
+
+    return normalized
 
 
 @app.get("/health")
@@ -119,13 +149,19 @@ async def draft_email(payload: DraftEmailRequest) -> LLMResponse:
 
 @app.post("/email/outreach", response_model=OutreachEmailResponse)
 async def draft_outreach_email(payload: OutreachEmailRequest) -> OutreachEmailResponse:
+    sender_name = (payload.sender_full_name or "Your Full Name").strip() or "Your Full Name"
     system = "You are an outreach email assistant for job seekers."
     user = (
         f"Recipient name: {payload.recipient_name}\n"
         f"Role: {payload.role}\n"
         f"Company: {payload.company}\n"
+        f"Sender full name: {sender_name}\n"
         f"Tone: {payload.tone}\n\n"
         "Use the resume details below to draft a concise, high-conversion outreach email.\n"
+        "The email must ask the recipient to review the attached resume.\n"
+        "The email must end exactly with:\n"
+        "Best Regards,\n"
+        f"{sender_name}\n\n"
         "Return format strictly:\n"
         "Subject: <subject line>\n"
         "<email body>\n\n"
@@ -142,6 +178,8 @@ async def draft_outreach_email(payload: OutreachEmailRequest) -> OutreachEmailRe
             resume_text=payload.resume_text,
         )
 
+    body = _finalize_outreach_body(body, payload.sender_full_name)
+
     if not payload.send_now:
         return OutreachEmailResponse(
             subject=subject,
@@ -149,6 +187,12 @@ async def draft_outreach_email(payload: OutreachEmailRequest) -> OutreachEmailRe
             sent=False,
             message_id=None,
             status="Draft generated. Set send_now=true to send via Gmail API.",
+        )
+
+    if not payload.resume_file_base64:
+        raise HTTPException(
+            status_code=400,
+            detail="resume_file_base64 is required when send_now=true. Please upload a resume PDF.",
         )
 
     connected, _ = gmail_oauth_service.get_status(payload.telegram_user_id)
@@ -164,12 +208,23 @@ async def draft_outreach_email(payload: OutreachEmailRequest) -> OutreachEmailRe
         )
 
     try:
+        attachment_bytes: Optional[bytes] = None
+        attachment_filename: Optional[str] = None
+        if payload.resume_file_base64:
+            try:
+                attachment_bytes = base64.b64decode(payload.resume_file_base64)
+                attachment_filename = payload.resume_filename or "resume.pdf"
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid resume_file_base64 payload: {exc}") from exc
+
         sent, message_id, status = await asyncio.to_thread(
             gmail_service.send_email,
             payload.telegram_user_id,
             payload.to_email,
             subject,
             body,
+            attachment_filename,
+            attachment_bytes,
         )
         return OutreachEmailResponse(
             subject=subject,

@@ -29,6 +29,9 @@ class OutreachEmailRequest(BaseModel):
     role: str
     company: str
     resume_text: str
+    sender_full_name: Optional[str] = None
+    resume_filename: Optional[str] = None
+    resume_file_base64: Optional[str] = None
     tone: str = "professional"
     send_now: bool = False
 

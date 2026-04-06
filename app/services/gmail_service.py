@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
@@ -21,6 +23,8 @@ class GmailService:
         to_email: str,
         subject: str,
         body: str,
+        attachment_filename: Optional[str] = None,
+        attachment_bytes: Optional[bytes] = None,
     ) -> tuple[bool, Optional[str], str]:
         if not self.is_configured():
             return (
@@ -46,7 +50,15 @@ class GmailService:
 
         service = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
-        message = MIMEText(body)
+        if attachment_filename and attachment_bytes:
+            message = MIMEMultipart()
+            message.attach(MIMEText(body, "plain"))
+            attachment = MIMEApplication(attachment_bytes, _subtype="pdf")
+            attachment.add_header("Content-Disposition", "attachment", filename=attachment_filename)
+            message.attach(attachment)
+        else:
+            message = MIMEText(body)
+
         message["to"] = to_email
         message["from"] = sender_email
         message["subject"] = subject

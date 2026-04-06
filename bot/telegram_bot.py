@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import shlex
 
@@ -10,6 +11,12 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 from app.config import settings
+
+
+PENDING_OUTREACH_BY_USER: dict[int, dict] = {}
+PENDING_OUTREACH_CONFIRMATION_BY_USER: dict[int, dict] = {}
+PENDING_RESUME_CHOICE_BY_USER: dict[int, dict] = {}
+LAST_RESUME_PDF_BY_USER: dict[int, dict] = {}
 
 
 def _help_text() -> str:
@@ -24,9 +31,8 @@ def _help_text() -> str:
         "/jobs <role> | <location> | <limit>\n"
         "/resume <target_role> || <resume_text> || <skill1,skill2>\n"
         "/email <purpose> || <recipient_name> || <context> || <tone>\n"
-        "/outreach <to_email> || <recipient_name> || <role> || <company> || <resume_text> || <tone> || <send_now:true|false>\n"
-        "or\n"
-        "/outreach \"to_email\" \"recipient_name\" \"role\" \"company\" \"resume_text\" \"tone\" \"true|false\"\n"
+        "/outreach <to_email> || <recipient_name> || <role> || <company>\n"
+        "(tone is fixed to polite; always draft first)\n"
         "/gmail_connect\n"
         "/gmail_status\n"
         "/gmail_disconnect\n"
@@ -73,6 +79,26 @@ async def main() -> None:
     bot = Bot(token=settings.telegram_bot_token)
     dp = Dispatcher()
 
+    async def _send_outreach_with_resume(pending: dict, resume_filename: str, resume_bytes: bytes) -> str:
+        payload = {
+            **pending,
+            "resume_text": "Please refer to the attached resume PDF for full details.",
+            "resume_filename": resume_filename or "resume.pdf",
+            "resume_file_base64": base64.b64encode(resume_bytes).decode("utf-8"),
+        }
+        data = await api_post("/email/outreach", payload)
+        response_text = (
+            f"Status: {data.get('status')}\n"
+            f"Sent: {data.get('sent')}\n"
+            f"Message ID: {data.get('message_id')}\n\n"
+            f"Subject: {data.get('subject')}\n\n"
+            f"{data.get('body')}"
+        )
+        connect_url = data.get("connect_url")
+        if connect_url:
+            response_text += f"\n\nConnect Gmail: {connect_url}"
+        return response_text
+
     @dp.message(CommandStart())
     async def start_handler(message: Message) -> None:
         await message.answer("Welcome.\n\n" + _help_text(), reply_markup=_main_menu_keyboard())
@@ -95,11 +121,14 @@ async def main() -> None:
     @dp.message(F.text == "3. Draft email")
     async def menu_email(message: Message) -> None:
         await message.answer(
-            "Draft only:\n"
-            "/outreach <to_email> || <recipient_name> || <role> || <company> || <resume_text> || <tone> || false\n\n"
-            "Draft + send via Gmail API:\n"
-            "/outreach <to_email> || <recipient_name> || <role> || <company> || <resume_text> || <tone> || true\n\n"
-            "Before sending, run /gmail_connect once to link your own Gmail account."
+            "Use:\n"
+            "/outreach <to_email> || <recipient_name> || <role> || <company>\n\n"
+            "Behavior:\n"
+            "1) Bot drafts outreach first (tone: polite).\n"
+            "2) Bot asks for confirmation (YES/NO).\n"
+            "3) If YES, upload resume PDF and it sends via Gmail API.\n\n"
+            "Before sending, run /gmail_connect once to link your own Gmail account.\n"
+            "Resume PDF is required for all sent outreach emails."
         )
 
     @dp.message(F.text == "4. Track job on Notion")
@@ -174,14 +203,12 @@ async def main() -> None:
     async def outreach_handler(message: Message) -> None:
         usage_text = (
             "Usage:\n"
-            "/outreach <to_email> || <recipient_name> || <role> || <company> || "
-            "<resume_text> || <tone> || <send_now:true|false>\n\n"
+            "/outreach <to_email> || <recipient_name> || <role> || <company>\n\n"
             "Example:\n"
-            "/outreach sally@gmail.com || Sally || Intern || Google || "
-            "CS student with Python, FastAPI, Telegram bot projects. || polite || true\n\n"
+            "/outreach sally@gmail.com || Sally || Intern || Google\n\n"
             "Alternative (quoted):\n"
-            "/outreach \"sally@gmail.com\" \"Sally\" \"Intern\" \"Google\" "
-            "\"CS student with Python and FastAPI\" \"polite\" \"true\""
+            "/outreach \"sally@gmail.com\" \"Sally\" \"Intern\" \"Google\"\n\n"
+            "Tone is fixed to polite. Bot always drafts first and asks YES/NO before sending."
         )
 
         try:
@@ -195,14 +222,16 @@ async def main() -> None:
 
             if "||" in raw:
                 parts = [x.strip() for x in raw.split("||")]
-                if len(parts) != 7:
+                if len(parts) != 4:
                     raise ValueError("Invalid outreach argument count")
-                to_email, recipient_name, role, company, resume_text, tone, send_now = parts
+                to_email, recipient_name, role, company = parts
             else:
                 parts = shlex.split(raw)
-                if len(parts) != 7:
+                if len(parts) != 4:
                     raise ValueError("Invalid outreach argument count")
-                to_email, recipient_name, role, company, resume_text, tone, send_now = parts
+                to_email, recipient_name, role, company = parts
+
+            tone = "polite"
 
             payload = {
                 "telegram_user_id": message.from_user.id,
@@ -210,9 +239,10 @@ async def main() -> None:
                 "recipient_name": recipient_name,
                 "role": role,
                 "company": company,
-                "resume_text": resume_text,
+                "resume_text": "Resume is available as PDF and can be shared when requested.",
+                "sender_full_name": message.from_user.full_name,
                 "tone": tone,
-                "send_now": send_now.lower() in {"true", "1", "yes", "y"},
+                "send_now": False,
             }
             data = await api_post("/email/outreach", payload)
             response_text = (
@@ -226,6 +256,17 @@ async def main() -> None:
             if connect_url:
                 response_text += f"\n\nConnect Gmail: {connect_url}"
             await message.answer(response_text)
+            PENDING_OUTREACH_CONFIRMATION_BY_USER[message.from_user.id] = {
+                "telegram_user_id": message.from_user.id,
+                "to_email": to_email,
+                "recipient_name": recipient_name,
+                "role": role,
+                "company": company,
+                "sender_full_name": message.from_user.full_name,
+                "tone": tone,
+                "send_now": True,
+            }
+            await message.answer("Send this now? Reply YES to continue or NO to cancel.")
         except ValueError:
             await message.answer(usage_text)
         except httpx.HTTPStatusError as exc:
@@ -238,6 +279,46 @@ async def main() -> None:
             await message.answer(f"{detail}\n\nIf needed:\n{usage_text}")
         except Exception as exc:
             await message.answer(f"Failed to process outreach request: {exc}\n\nIf needed:\n{usage_text}")
+
+    @dp.message(F.document)
+    async def resume_pdf_upload_handler(message: Message) -> None:
+        if not message.from_user:
+            return
+
+        pending = PENDING_OUTREACH_BY_USER.get(message.from_user.id)
+        document = message.document
+        if not document:
+            return
+
+        file_name = (document.file_name or "").lower()
+        mime_type = (document.mime_type or "").lower()
+        if not (file_name.endswith(".pdf") or mime_type == "application/pdf"):
+            await message.answer("Please upload a PDF file (.pdf).")
+            return
+
+        try:
+            telegram_file = await bot.get_file(document.file_id)
+            downloaded = await bot.download_file(telegram_file.file_path)
+            resume_bytes = downloaded.read()
+
+            LAST_RESUME_PDF_BY_USER[message.from_user.id] = {
+                "filename": document.file_name or "resume.pdf",
+                "bytes": resume_bytes,
+            }
+
+            if not pending:
+                await message.answer("Resume PDF saved. I can reuse this for your next outreach send.")
+                return
+
+            response_text = await _send_outreach_with_resume(
+                pending,
+                document.file_name or "resume.pdf",
+                resume_bytes,
+            )
+            await message.answer(response_text)
+            PENDING_OUTREACH_BY_USER.pop(message.from_user.id, None)
+        except Exception as exc:
+            await message.answer(f"Failed to process uploaded PDF: {exc}")
 
     @dp.message(Command("gmail_connect"))
     async def gmail_connect_handler(message: Message) -> None:
@@ -338,7 +419,68 @@ async def main() -> None:
             await message.answer("Usage: /interview <role> || <company> || <focus1,focus2>")
 
     @dp.message(F.text)
-    async def fallback_handler(message: Message) -> None:
+    async def outreach_confirmation_handler(message: Message) -> None:
+        if not message.from_user:
+            await message.answer("Unknown command. Use /help")
+            return
+
+        user_id = message.from_user.id
+        text = (message.text or "").strip().lower()
+
+        pending_choice = PENDING_RESUME_CHOICE_BY_USER.get(user_id)
+        if pending_choice:
+            if text in {"use", "use previous", "previous", "1"}:
+                last_resume = LAST_RESUME_PDF_BY_USER.get(user_id)
+                if not last_resume:
+                    PENDING_RESUME_CHOICE_BY_USER.pop(user_id, None)
+                    PENDING_OUTREACH_BY_USER[user_id] = pending_choice
+                    await message.answer("No previous resume found. Please upload your resume as a PDF.")
+                    return
+
+                try:
+                    response_text = await _send_outreach_with_resume(
+                        pending_choice,
+                        last_resume.get("filename", "resume.pdf"),
+                        last_resume.get("bytes", b""),
+                    )
+                    await message.answer(response_text)
+                except Exception as exc:
+                    await message.answer(f"Failed to send using previous resume: {exc}")
+                finally:
+                    PENDING_RESUME_CHOICE_BY_USER.pop(user_id, None)
+                return
+
+            if text in {"new", "upload new", "2"}:
+                PENDING_OUTREACH_BY_USER[user_id] = pending_choice
+                PENDING_RESUME_CHOICE_BY_USER.pop(user_id, None)
+                await message.answer("Please upload your new resume as a PDF.")
+                return
+
+            await message.answer("Reply USE to send with previous resume, or NEW to upload a new PDF.")
+            return
+
+        pending_confirm = PENDING_OUTREACH_CONFIRMATION_BY_USER.get(user_id)
+        if pending_confirm:
+            if text in {"yes", "y"}:
+                PENDING_OUTREACH_CONFIRMATION_BY_USER.pop(user_id, None)
+                if user_id in LAST_RESUME_PDF_BY_USER:
+                    PENDING_RESUME_CHOICE_BY_USER[user_id] = pending_confirm
+                    await message.answer(
+                        "I found a previously uploaded resume PDF. Reply USE to use previous, or NEW to upload a new one."
+                    )
+                else:
+                    PENDING_OUTREACH_BY_USER[user_id] = pending_confirm
+                    await message.answer("Great. Please upload your resume as a PDF to send this outreach now.")
+                return
+
+            if text in {"no", "n"}:
+                PENDING_OUTREACH_CONFIRMATION_BY_USER.pop(user_id, None)
+                await message.answer("Cancelled. You can run /outreach again anytime.")
+                return
+
+            await message.answer("Please reply YES to send now, or NO to cancel.")
+            return
+
         await message.answer("Unknown command. Use /help")
 
     await dp.start_polling(bot)
