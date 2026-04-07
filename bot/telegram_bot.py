@@ -18,6 +18,7 @@ PENDING_OUTREACH_CONFIRMATION_BY_USER: dict[int, dict] = {}
 PENDING_RESUME_CHOICE_BY_USER: dict[int, dict] = {}
 LAST_RESUME_PDF_BY_USER: dict[int, dict] = {}
 JOB_SEARCH_STATE_BY_USER: dict[int, dict] = {}
+OUTREACH_INPUT_STATE_BY_USER: dict[int, dict] = {}
 
 
 def _help_text() -> str:
@@ -32,8 +33,8 @@ def _help_text() -> str:
         "/jobs <role> | <location> | <limit>\n"
         "/resume <target_role> || <resume_text> || <skill1,skill2>\n"
         "/email <purpose> || <recipient_name> || <context> || <tone>\n"
-        "/outreach <to_email> || <recipient_name> || <role> || <company>\n"
-        "(tone is fixed to polite; always draft first)\n"
+        "/outreach \"to_email\" \"recipient_name\" \"role\" \"company\"\n"
+        "(tone is fixed to polite; always draft first; pipe format still supported)\n"
         "/gmail_connect\n"
         "/gmail_status\n"
         "/gmail_disconnect\n"
@@ -100,6 +101,87 @@ async def main() -> None:
             response_text += f"\n\nConnect Gmail: {connect_url}"
         return response_text
 
+    async def _draft_outreach_and_ask_confirm(
+        user_id: int,
+        sender_full_name: str,
+        to_email: str,
+        recipient_name: str,
+        role: str,
+        company: str,
+    ) -> None:
+        payload = {
+            "telegram_user_id": user_id,
+            "to_email": to_email,
+            "recipient_name": recipient_name,
+            "role": role,
+            "company": company,
+            "resume_text": "Resume is available as PDF and can be shared when requested.",
+            "sender_full_name": sender_full_name,
+            "tone": "polite",
+            "send_now": False,
+        }
+        data = await api_post("/email/outreach", payload)
+        response_text = (
+            f"Status: {data.get('status')}\n"
+            f"Sent: {data.get('sent')}\n"
+            f"Message ID: {data.get('message_id')}\n\n"
+            f"Subject: {data.get('subject')}\n\n"
+            f"{data.get('body')}"
+        )
+        connect_url = data.get("connect_url")
+        if connect_url:
+            response_text += f"\n\nConnect Gmail: {connect_url}"
+
+        await bot.send_message(user_id, response_text)
+        PENDING_OUTREACH_CONFIRMATION_BY_USER[user_id] = {
+            "telegram_user_id": user_id,
+            "to_email": to_email,
+            "recipient_name": recipient_name,
+            "role": role,
+            "company": company,
+            "sender_full_name": sender_full_name,
+            "tone": "polite",
+            "send_now": True,
+        }
+        await bot.send_message(user_id, "Send this now? Reply YES to continue or NO to cancel.")
+
+    def _parse_outreach_args(raw: str) -> tuple[str, str, str, str]:
+        cleaned = raw.strip()
+        if not cleaned:
+            raise ValueError("Missing outreach arguments")
+
+        if "||" in cleaned:
+            parts = [part.strip() for part in cleaned.split("||") if part.strip()]
+            if len(parts) == 4:
+                return parts[0], parts[1], parts[2], parts[3]
+
+            if len(parts) == 2:
+                left_tokens = shlex.split(parts[0])
+                if len(left_tokens) >= 3:
+                    to_email = left_tokens[0]
+                    recipient_name = left_tokens[1]
+                    role = " ".join(left_tokens[2:])
+                    company = parts[1]
+                    return to_email, recipient_name, role, company
+
+            raise ValueError("Invalid outreach argument count")
+
+        tokens = shlex.split(cleaned)
+        if len(tokens) == 4:
+            return tokens[0], tokens[1], tokens[2], tokens[3]
+
+        if len(tokens) > 4:
+            to_email = tokens[0]
+            recipient_name = tokens[1]
+            role = " ".join(tokens[2:-1])
+            company = tokens[-1]
+            return to_email, recipient_name, role, company
+
+        raise ValueError("Invalid outreach argument count")
+
+    def _start_outreach_flow(user_id: int) -> None:
+        OUTREACH_INPUT_STATE_BY_USER[user_id] = {"step": "to_email"}
+
     def _job_results_keyboard(jobs: list[dict]) -> InlineKeyboardMarkup:
         rows = []
         for idx, job in enumerate(jobs, start=1):
@@ -162,7 +244,9 @@ async def main() -> None:
     async def menu_email(message: Message) -> None:
         await message.answer(
             "Use:\n"
-            "/outreach <to_email> || <recipient_name> || <role> || <company>\n\n"
+            "/outreach \"to_email\" \"recipient_name\" \"role\" \"company\"\n\n"
+            "Example:\n"
+            "/outreach \"sally@gmail.com\" \"Sally\" \"Software Engineer Full-time\" \"Apple\"\n\n"
             "Behavior:\n"
             "1) Bot drafts outreach first (tone: polite).\n"
             "2) Bot asks for confirmation (YES/NO).\n"
@@ -217,7 +301,7 @@ async def main() -> None:
         except Exception:
             await message.answer("Usage: /jobs <role> | <location> | <limit>")
 
-    @dp.message(F.text)
+    @dp.message(lambda message: bool(message.from_user and message.from_user.id in JOB_SEARCH_STATE_BY_USER), F.text & ~F.text.startswith("/"))
     async def job_search_flow_handler(message: Message) -> None:
         if not message.from_user:
             return
@@ -228,6 +312,10 @@ async def main() -> None:
 
         text = (message.text or "").strip()
         if not text:
+            return
+
+        # Let slash commands be handled by command handlers.
+        if text.startswith("/"):
             return
 
         step = state.get("step")
@@ -292,11 +380,13 @@ async def main() -> None:
     async def outreach_handler(message: Message) -> None:
         usage_text = (
             "Usage:\n"
-            "/outreach <to_email> || <recipient_name> || <role> || <company>\n\n"
+            "/outreach \"to_email\" \"recipient_name\" \"role\" \"company\"\n\n"
             "Example:\n"
-            "/outreach sally@gmail.com || Sally || Intern || Google\n\n"
-            "Alternative (quoted):\n"
             "/outreach \"sally@gmail.com\" \"Sally\" \"Intern\" \"Google\"\n\n"
+            "Also supported (pipe format):\n"
+            "/outreach sally@gmail.com || Sally || Intern || Google\n\n"
+            "Also supported (partial pipe format):\n"
+            "/outreach sally@gmail.com Sally Intern || Google\n\n"
             "Tone is fixed to polite. Bot always drafts first and asks YES/NO before sending."
         )
 
@@ -307,57 +397,32 @@ async def main() -> None:
 
             raw = (message.text or "").replace("/outreach", "", 1).strip()
             if not raw:
-                raise ValueError("Missing outreach arguments")
+                _start_outreach_flow(message.from_user.id)
+                await message.answer("What email should this outreach go to?")
+                return
 
-            if "||" in raw:
-                parts = [x.strip() for x in raw.split("||")]
-                if len(parts) != 4:
-                    raise ValueError("Invalid outreach argument count")
-                to_email, recipient_name, role, company = parts
-            else:
-                parts = shlex.split(raw)
-                if len(parts) != 4:
-                    raise ValueError("Invalid outreach argument count")
-                to_email, recipient_name, role, company = parts
+            if "<" in raw and ">" in raw:
+                await message.answer(
+                    "Please replace placeholders with actual values.\n"
+                    "Example: /outreach whateverjesica@gmail.com || Sally || Intern || Google"
+                )
+                return
 
-            tone = "polite"
+            try:
+                to_email, recipient_name, role, company = _parse_outreach_args(raw)
+            except ValueError:
+                _start_outreach_flow(message.from_user.id)
+                await message.answer("What email should this outreach go to?")
+                return
 
-            payload = {
-                "telegram_user_id": message.from_user.id,
-                "to_email": to_email,
-                "recipient_name": recipient_name,
-                "role": role,
-                "company": company,
-                "resume_text": "Resume is available as PDF and can be shared when requested.",
-                "sender_full_name": message.from_user.full_name,
-                "tone": tone,
-                "send_now": False,
-            }
-            data = await api_post("/email/outreach", payload)
-            response_text = (
-                f"Status: {data.get('status')}\n"
-                f"Sent: {data.get('sent')}\n"
-                f"Message ID: {data.get('message_id')}\n\n"
-                f"Subject: {data.get('subject')}\n\n"
-                f"{data.get('body')}"
+            await _draft_outreach_and_ask_confirm(
+                user_id=message.from_user.id,
+                sender_full_name=message.from_user.full_name,
+                to_email=to_email,
+                recipient_name=recipient_name,
+                role=role,
+                company=company,
             )
-            connect_url = data.get("connect_url")
-            if connect_url:
-                response_text += f"\n\nConnect Gmail: {connect_url}"
-            await message.answer(response_text)
-            PENDING_OUTREACH_CONFIRMATION_BY_USER[message.from_user.id] = {
-                "telegram_user_id": message.from_user.id,
-                "to_email": to_email,
-                "recipient_name": recipient_name,
-                "role": role,
-                "company": company,
-                "sender_full_name": message.from_user.full_name,
-                "tone": tone,
-                "send_now": True,
-            }
-            await message.answer("Send this now? Reply YES to continue or NO to cancel.")
-        except ValueError:
-            await message.answer(usage_text)
         except httpx.HTTPStatusError as exc:
             detail = "Failed to process outreach request."
             try:
@@ -514,7 +579,42 @@ async def main() -> None:
             return
 
         user_id = message.from_user.id
-        text = (message.text or "").strip().lower()
+        raw_text = (message.text or "").strip()
+        text = raw_text.lower()
+
+        # Do not intercept slash-commands; let command handlers process them.
+        if raw_text.startswith("/"):
+            return
+
+        outreach_flow = OUTREACH_INPUT_STATE_BY_USER.get(user_id)
+        if outreach_flow:
+            step = outreach_flow.get("step")
+            if step == "to_email":
+                outreach_flow["to_email"] = (message.text or "").strip()
+                outreach_flow["step"] = "recipient_name"
+                await message.answer("Recipient name?")
+                return
+            if step == "recipient_name":
+                outreach_flow["recipient_name"] = (message.text or "").strip()
+                outreach_flow["step"] = "role"
+                await message.answer("Role?")
+                return
+            if step == "role":
+                outreach_flow["role"] = (message.text or "").strip()
+                outreach_flow["step"] = "company"
+                await message.answer("Company?")
+                return
+            if step == "company":
+                OUTREACH_INPUT_STATE_BY_USER.pop(user_id, None)
+                await _draft_outreach_and_ask_confirm(
+                    user_id=user_id,
+                    sender_full_name=message.from_user.full_name,
+                    to_email=outreach_flow.get("to_email", ""),
+                    recipient_name=outreach_flow.get("recipient_name", ""),
+                    role=outreach_flow.get("role", ""),
+                    company=(message.text or "").strip(),
+                )
+                return
 
         if user_id in JOB_SEARCH_STATE_BY_USER:
             return
