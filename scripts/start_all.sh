@@ -1,28 +1,35 @@
 #!/bin/bash
 set -e
-
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 if [ ! -f .env ]; then
-  echo "ERROR: .env file not found. Copy .env.example and fill in your values."
+  echo "ERROR: .env not found. Copy .env.example and fill in your values."
   exit 1
 fi
 
-echo "Starting Job Hunter PA..."
-echo ""
+echo "==================================="
+echo "  Job Hunter PA – Starting up"
+echo "==================================="
 
-# Start the FastAPI backend in the background
-echo "[1/2] Starting backend on http://localhost:8000"
+# Start FastAPI backend
+echo "[1/2] Starting backend on :8000"
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!
 
-# Give the backend 2 seconds to start before the bot connects to it
-sleep 2
+# Wait for backend to be ready
+echo "Waiting for backend..."
+for i in {1..10}; do
+  if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+    echo "✅ Backend is ready"
+    break
+  fi
+  sleep 1
+done
 
-# Start the Telegram bot in the foreground
+# Start Telegram bot
 echo "[2/2] Starting Telegram bot"
 python -m bot.telegram_bot
 
-# If the bot exits, also kill the backend
-kill $BACKEND_PID 2>/dev/null
+# Cleanup
+kill $BACKEND_PID 2>/dev/null || true

@@ -1,149 +1,79 @@
 """
-MyCareersFuture API Integration
-Singapore's official government job portal
-~80,000+ active listings, includes salary ranges
+MyCareersFuture – Singapore government job portal.
+Uses the public JSON API (no auth required, 80K+ listings, includes salary).
+Endpoint discovered via community reverse-engineering (stable since 2023).
 """
 import httpx
-from datetime import datetime
-from typing import Optional
-import json
 import logging
-
+from datetime import datetime
 from . import BaseJobSource, JobPosting
 
 logger = logging.getLogger(__name__)
 
+BASE = "https://api.mycareersfuture.gov.sg/v2/jobs"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; JobHunterPA/1.0)",
+    "Accept": "application/json",
+}
+
 
 class MyCareersFutureSource(BaseJobSource):
-    """
-    MyCareersFuture - Singapore's official government job board.
-    Covers all sectors, includes salary transparency.
-    No authentication required, public JSON API.
-    """
-    
-    BASE_URL = "https://api.mycareersfuture.sg/search"
-    
-    def __init__(self):
-        super().__init__()
-        self.name = "MyCareersFuture"
-        self.description = "Singapore government job portal (80K+ listings)"
-    
-    async def search_jobs(
-        self,
-        query: str,
-        location: str = "singapore",
-        limit: int = 20,
-    ) -> list[JobPosting]:
-        """
-        Search MyCareersFuture API
-        
-        Returns:
-            List of JobPosting objects
-        """
+    name = "MyCareersFuture"
+
+    async def search_jobs(self, query: str, location: str = "singapore", limit: int = 20) -> list[JobPosting]:
+        params = {
+            "search": query,
+            "limit": min(limit, 100),
+            "page": 0,
+            "sortBy": "new_posting_date",
+        }
         try:
-            params = {
-                "search": query,
-                "limit": min(limit, 100),  # API max is 100
-                "page": 1,
-            }
-            
-            # MCF doesn't have location filter in easy API
-            # Location filtering done post-response
-            
-            async with httpx.AsyncClient(timeout=15) as client:
-                response = await client.get(self.BASE_URL, params=params)
-                response.raise_for_status()
-                data = response.json()
-            
-            jobs = []
-            for result in data.get("results", [])[:limit]:
-                try:
-                    job = self._parse_mcf_job(result)
-                    
-                    # Simple location filter
-                    if self._location_matches(job.location, location):
-                        jobs.append(job)
-                except Exception as e:
-                    logger.warning(f"Error parsing MCF job: {e}")
-                    continue
-            
-            logger.info(f"MyCareersFuture found {len(jobs)} jobs for '{query}'")
-            return jobs
-            
+            async with httpx.AsyncClient(timeout=15, headers=HEADERS) as client:
+                r = await client.get(BASE, params=params)
+                r.raise_for_status()
+                data = r.json()
         except Exception as e:
-            logger.error(f"MyCareersFuture search failed: {e}")
+            logger.error(f"MCF error: {e}")
             return []
-    
-    @staticmethod
-    def _parse_mcf_job(item: dict) -> JobPosting:
-        """Parse MCF API response into JobPosting"""
-        
-        # Extract salary info (MCF provides min/max separately)
-        salary_min = None
-        salary_max = None
-        if item.get("salaryMin") and item.get("salaryMax"):
-            salary_min = float(item["salaryMin"])
-            salary_max = float(item["salaryMax"])
-        
-        # Parse employment type
-        job_type = None
-        if item.get("employment"):
-            job_type = item["employment"][0] if isinstance(item["employment"], list) else item["employment"]
-        
-        # Posted date
-        posted_at = None
-        if item.get("postedDate"):
+
+        jobs = []
+        for item in (data.get("results") or [])[:limit]:
             try:
-                posted_at = datetime.fromisoformat(item["postedDate"].replace("Z", "+00:00"))
-            except:
+                jobs.append(self._parse(item))
+            except Exception as e:
+                logger.debug(f"MCF parse error: {e}")
+        logger.info(f"MCF: {len(jobs)} jobs for '{query}'")
+        return jobs
+
+    @staticmethod
+    def _parse(item: dict) -> JobPosting:
+        salary = item.get("salary") or {}
+        sal_min = float(salary.get("minimum", 0)) or None
+        sal_max = float(salary.get("maximum", 0)) or None
+
+        posted_at = None
+        if item.get("metadata", {}).get("newPostingDate"):
+            try:
+                posted_at = datetime.fromisoformat(item["metadata"]["newPostingDate"][:10])
+            except Exception:
                 pass
-        
+
+        job_id = item.get("uuid", "")
+        url = f"https://www.mycareersfuture.gov.sg/job/{job_id}" if job_id else ""
+
+        emp_types = item.get("employmentTypes") or []
+        job_type = emp_types[0].get("employmentType") if emp_types else None
+
         return JobPosting(
-            title=item.get("jobTitle", "Unknown"),
-            company=item.get("company", "Unknown"),
-            location=item.get("location", "Singapore"),
-            url=item.get("listingUrl", f"https://mycareersfuture.sg/job/{item.get('id', '')}"),
+            title=item.get("title", "Unknown"),
+            company=(item.get("postedCompany") or {}).get("name", "Unknown"),
+            location="Singapore",
+            url=url,
             source="MyCareersFuture",
             job_type=job_type,
-            salary_min=salary_min,
-            salary_max=salary_max,
+            salary_min=sal_min,
+            salary_max=sal_max,
             currency="SGD",
-            description=item.get("description"),
-            requirements=item.get("requirements"),
+            description=(item.get("description") or "")[:500],
             posted_at=posted_at,
         )
-    
-    @staticmethod
-    def _location_matches(job_location: str, search_location: str) -> bool:
-        """Check if job location matches search location"""
-        job_loc = job_location.lower().strip()
-        search_loc = search_location.lower().strip()
-        
-        # Exact match
-        if job_loc == search_loc:
-            return True
-        
-        # Singapore variations
-        if search_loc in ["sg", "singapore"]:
-            return "singapore" in job_loc or "sg" in job_loc
-        
-        # Remote matches
-        if search_loc == "remote":
-            return "remote" in job_loc
-        
-        return True  # Default: include it
-
-
-# Test the source
-if __name__ == "__main__":
-    import asyncio
-    
-    async def test():
-        source = MyCareersFutureSource()
-        jobs = await source.search_jobs("Data Analyst", "singapore", 5)
-        for job in jobs:
-            print(f"✓ {job.title} at {job.company} ({job.location})")
-            if job.salary_min:
-                print(f"  Salary: SGD {job.salary_min:,.0f} - {job.salary_max:,.0f}")
-    
-    asyncio.run(test())
