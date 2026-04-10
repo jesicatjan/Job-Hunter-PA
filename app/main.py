@@ -2,9 +2,10 @@ from typing import Optional
 import base64
 import binascii
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.responses import HTMLResponse
 import asyncio
+from sqlmodel import Session
 
 from app.schemas import (
     DraftEmailRequest,
@@ -23,11 +24,18 @@ from app.schemas import (
     NotionSummaryResponse,      
     ResumeTailorRequest, 
 )
+from app.schemas_applications import ApplicationCreate, ApplicationResponse, ApplicationsListResponse
 from app.services.gmail_oauth_service import gmail_oauth_service
 from app.services.gmail_service import gmail_service
 from app.services.job_service import job_service
 from app.services.notion_service import notion_service
 from app.services.openclaw_client import openclaw_client
+from app.database import init_db, get_session
+from app.services.job_service_enhanced import get_enhanced_job_service
+from app.services.resume_service import ResumeManager
+
+# Initialize database on startup
+init_db()
 
 app = FastAPI(title="Job Hunter Personal Assistant API", version="1.0.0")
 
@@ -93,12 +101,40 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/jobs/search", response_model=JobsResponse)
-async def search_jobs(payload: JobsRequest) -> JobsResponse:
-    jobs = await job_service.search_jobs(payload.role, payload.location or "remote", payload.limit)
-    return JobsResponse(
-        query={"role": payload.role, "location": payload.location, "limit": payload.limit},
-        jobs=jobs,
-    )
+async def search_jobs(
+    payload: JobsRequest,
+    session: Session = Depends(get_session),
+) -> JobsResponse:
+    """
+    Enhanced multi-source job search with deduplication
+    
+    Searches:
+    1. MyCareersFuture (Singapore official)
+    2. Indeed RSS (Australia + Singapore)
+    3. Jora RSS (all countries)
+    
+    Results are deduplicated, ranked, and stored to database
+    """
+    try:
+        service = get_enhanced_job_service(session)
+        result = await service.search_jobs(
+            query=payload.role,
+            location=payload.location or "singapore",
+            limit=payload.limit,
+            user_id=None,  # TODO: Get from auth context
+        )
+        
+        return JobsResponse(
+            query={
+                "role": payload.role,
+                "location": payload.location,
+                "limit": payload.limit,
+            },
+            jobs=result.get("jobs", []),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/resume/revise", response_model=LLMResponse)
@@ -368,3 +404,63 @@ async def get_notion_summary() -> NotionSummaryResponse:
         return NotionSummaryResponse(applications=apps, total=len(apps))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to fetch summary: {exc}") from exc
+
+
+# ==================== APPLICATION TRACKING ====================
+
+# In-memory storage for applications (for demo - use DB in production)
+APPLICATIONS_STORAGE = {}
+APPLICATION_ID_COUNTER = 0
+
+
+@app.post("/applications", response_model=ApplicationResponse)
+async def save_application(data: ApplicationCreate) -> ApplicationResponse:
+    """Save or update a tracked application"""
+    global APPLICATION_ID_COUNTER
+    
+    APPLICATION_ID_COUNTER += 1
+    app_id = f"app_{APPLICATION_ID_COUNTER}"
+    
+    app_data = {
+        "id": app_id,
+        "job_title": data.job_title,
+        "company": data.company,
+        "status": data.status,
+        "match_score": data.match_score,
+        "resume_keywords": data.resume_keywords or [],
+        "resume_text": data.resume_text,
+        "applied_date": None,
+        "interview_date": None,
+        "follow_up_date": None,
+        "notes": None,
+    }
+    
+    APPLICATIONS_STORAGE[app_id] = app_data
+    
+    return ApplicationResponse(
+        id=app_id,
+        job_title=data.job_title,
+        company=data.company,
+        status=data.status,
+        match_score=data.match_score
+    )
+
+
+@app.get("/applications", response_model=ApplicationsListResponse)
+async def get_applications() -> ApplicationsListResponse:
+    """Retrieve all tracked applications"""
+    apps = []
+    for app_id, app_data in APPLICATIONS_STORAGE.items():
+        apps.append(ApplicationResponse(
+            id=app_id,
+            job_title=app_data["job_title"],
+            company=app_data["company"],
+            status=app_data["status"],
+            match_score=app_data["match_score"],
+            applied_date=app_data.get("applied_date"),
+            interview_date=app_data.get("interview_date"),
+            follow_up_date=app_data.get("follow_up_date"),
+            notes=app_data.get("notes")
+        ))
+    
+    return ApplicationsListResponse(applications=apps, total=len(apps))
