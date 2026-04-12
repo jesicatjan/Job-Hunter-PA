@@ -1,328 +1,239 @@
-from typing import Optional
+"""
+Job Hunter PA – FastAPI backend v2.1
+All endpoints. LLM errors returned as text (no 500s).
+"""
+from __future__ import annotations
 import base64
-import binascii
+import logging
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
-import asyncio
+from pydantic import BaseModel
 
-from app.schemas import (
-    DraftEmailRequest,
-    GmailConnectLinkResponse,
-    GmailConnectionStatusResponse,
-    GmailDisconnectRequest,
-    InterviewPrepRequest,
-    JobsRequest,
-    JobsResponse,
-    LLMResponse,
-    OutreachEmailRequest,
-    OutreachEmailResponse,
-    ResumeReviseRequest,
-    TrackJobRequest,
-    TrackJobResponse,
-)
-from app.services.gmail_oauth_service import gmail_oauth_service
-from app.services.gmail_service import gmail_service
-from app.services.job_service import job_service
-from app.services.notion_service import notion_service
-from app.services.openclaw_client import openclaw_client
+from app import database as db
+from app.config import settings
+from app.services import job_aggregator, gmail_service, llm_tasks
+from app.resume_utils import gap_analysis
 
-app = FastAPI(title="Job Hunter Personal Assistant API", version="1.0.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+db.init_db()
+app = FastAPI(title="Job Hunter PA", version="2.1.0")
 
 
-def _split_subject_and_body(text: str) -> tuple[str, str]:
-    lines = [line for line in text.strip().splitlines()]
-    if not lines:
-        return "Job Application Outreach", ""
-
-    first = lines[0].strip()
-    if first.lower().startswith("subject:"):
-        subject = first.split(":", 1)[1].strip() or "Job Application Outreach"
-        body = "\n".join(lines[1:]).strip()
-        return subject, body
-
-    return "Job Application Outreach", text.strip()
-
-
-def _fallback_outreach_draft(recipient_name: str, role: str, company: str, resume_text: str) -> tuple[str, str]:
-    placeholder_markers = {
-        "please refer to the attached resume pdf for full details.",
-        "resume is available as pdf and can be shared when requested.",
-    }
-    normalized_resume_text = (resume_text or "").strip()
-    include_highlights = bool(normalized_resume_text) and normalized_resume_text.lower() not in placeholder_markers
-
-    subject = f"Application Interest: {role} role at {company}"
-    highlights_section = ""
-    if include_highlights:
-        highlights_section = f"Highlights from my profile:\n{normalized_resume_text}\n\n"
-
-    body = (
-        f"Hi {recipient_name},\n\n"
-        f"I hope you are doing well. I am reaching out to express my interest in the {role} role at {company}. "
-        "I believe my background is a strong fit for this opportunity.\n\n"
-        f"{highlights_section}"
-        "I would be grateful for the opportunity to discuss how I can contribute to your team. "
-        "Please find my resume attached for your review.\n\n"
-        "Thank you for your time and consideration."
-    )
-    return subject, body
-
-
-def _finalize_outreach_body(body: str, sender_full_name: Optional[str] = None) -> str:
-    sender_name = (sender_full_name or "Your Full Name").strip() or "Your Full Name"
-    normalized = body.strip()
-    lower = normalized.lower()
-
-    if "resume attached" not in lower and "find my resume attached" not in lower:
-        normalized += "\n\nPlease find my resume attached for your review."
-
-    if "best regards" not in lower:
-        normalized += f"\n\nBest Regards,\n{sender_name}"
-    elif sender_name.lower() not in lower:
-        normalized += f"\n{sender_name}"
-
-    return normalized
-
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health():
+    return {"status": "ok", "version": "2.1.0"}
 
 
-@app.post("/jobs/search", response_model=JobsResponse)
-async def search_jobs(payload: JobsRequest) -> JobsResponse:
-    jobs = await job_service.search_jobs(payload.role, payload.location or "remote", payload.limit)
-    return JobsResponse(
-        query={"role": payload.role, "location": payload.location, "limit": payload.limit},
-        jobs=jobs,
+# ── Job Search ────────────────────────────────────────────────────────────────
+
+class JobsRequest(BaseModel):
+    role: str
+    location: str = "singapore"
+    limit: int = 10
+    telegram_id: Optional[int] = None
+    new_only: bool = False
+
+
+@app.post("/jobs/search")
+async def search_jobs(req: JobsRequest):
+    try:
+        jobs = await job_aggregator.search_jobs(
+            query=req.role, location=req.location, limit=req.limit,
+            telegram_id=req.telegram_id, new_only=req.new_only,
+        )
+        return {"jobs": jobs, "total": len(jobs)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── Resume ────────────────────────────────────────────────────────────────────
+
+class ResumeReviseRequest(BaseModel):
+    resume_text: str
+    target_role: str
+    telegram_id: Optional[int] = None
+
+
+@app.post("/resume/revise")
+async def revise_resume(req: ResumeReviseRequest):
+    if req.telegram_id:
+        db.save_master_resume(req.telegram_id, req.resume_text)
+    # llm_client.complete never raises - returns error string on failure
+    text = await llm_tasks.resume_revise(req.resume_text, req.target_role)
+    return {"text": text}
+
+
+class TailorRequest(BaseModel):
+    resume_text: str
+    job_description: str
+    job_title: str = ""
+    company: str = ""
+
+
+@app.post("/resume/tailor")
+async def tailor_resume(req: TailorRequest):
+    text = await llm_tasks.resume_tailor(
+        req.resume_text, req.job_description, req.job_title, req.company
     )
+    gap = gap_analysis(req.resume_text, req.job_description)
+    return {"text": text, "gap": gap}
 
 
-@app.post("/resume/revise", response_model=LLMResponse)
-async def revise_resume(payload: ResumeReviseRequest) -> LLMResponse:
-    system = "You are an expert career coach and resume reviewer."
-    user = (
-        f"Target role: {payload.target_role}\n"
-        f"Key skills: {', '.join(payload.key_skills) if payload.key_skills else 'N/A'}\n"
-        "Please revise this resume for impact and ATS friendliness.\n"
-        "Return:\n"
-        "1) Improved resume text\n"
-        "2) Top 5 changes made\n\n"
-        f"Resume:\n{payload.current_resume}"
+# ── Email ─────────────────────────────────────────────────────────────────────
+
+class EmailDraftRequest(BaseModel):
+    purpose: str
+    recipient_name: str
+    context: str
+    tone: str = "professional"
+
+
+@app.post("/email/draft")
+async def draft_email(req: EmailDraftRequest):
+    text = await llm_tasks.draft_email(
+        req.purpose, req.recipient_name, req.context, req.tone
     )
-    try:
-        text = await openclaw_client.complete(system, user)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "LLM service is unavailable. Check OPENCLAW_API_URL and make sure the model server is running. "
-                f"({exc})"
-            ),
-        ) from exc
-    return LLMResponse(text=text)
+    return {"text": text}
 
 
-@app.post("/email/draft", response_model=LLMResponse)
-async def draft_email(payload: DraftEmailRequest) -> LLMResponse:
-    system = "You are a professional communication assistant specialized in job search emails."
-    user = (
-        f"Purpose: {payload.purpose}\n"
-        f"Recipient name: {payload.recipient_name}\n"
-        f"Tone: {payload.tone}\n"
-        f"Context: {payload.context}\n\n"
-        "Draft a polished email with a clear subject line and call to action."
+class OutreachRequest(BaseModel):
+    telegram_id: int
+    to_email: str
+    recipient_name: str
+    role: str
+    company: str
+    sender_name: str
+    resume_highlights: str = ""
+    resume_bytes_b64: Optional[str] = None
+    send_now: bool = False
+
+
+@app.post("/email/outreach")
+async def outreach_email(req: OutreachRequest):
+    subject, body = await llm_tasks.draft_outreach(
+        req.recipient_name, req.role, req.company,
+        req.sender_name, req.resume_highlights,
     )
-    try:
-        text = await openclaw_client.complete(system, user)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "LLM service is unavailable. Check OPENCLAW_API_URL and make sure the model server is running. "
-                f"({exc})"
-            ),
-        ) from exc
-    return LLMResponse(text=text)
+    if not req.send_now:
+        return {"subject": subject, "body": body, "sent": False}
 
-
-@app.post("/email/outreach", response_model=OutreachEmailResponse)
-async def draft_outreach_email(payload: OutreachEmailRequest) -> OutreachEmailResponse:
-    sender_name = (payload.sender_full_name or "Your Full Name").strip() or "Your Full Name"
-    system = "You are an outreach email assistant for job seekers."
-    user = (
-        f"Recipient name: {payload.recipient_name}\n"
-        f"Role: {payload.role}\n"
-        f"Company: {payload.company}\n"
-        f"Sender full name: {sender_name}\n"
-        f"Tone: {payload.tone}\n\n"
-        "Use the resume details below to draft a concise, high-conversion outreach email.\n"
-        "The email must ask the recipient to review the attached resume.\n"
-        "The email must end exactly with:\n"
-        "Best Regards,\n"
-        f"{sender_name}\n\n"
-        "Return format strictly:\n"
-        "Subject: <subject line>\n"
-        "<email body>\n\n"
-        f"Resume details:\n{payload.resume_text}"
+    att_bytes = base64.b64decode(req.resume_bytes_b64) if req.resume_bytes_b64 else None
+    ok, msg_id = gmail_service.send_email(
+        req.telegram_id, req.to_email, subject, body,
+        attachment_bytes=att_bytes, attachment_name="resume.pdf",
     )
+    if not ok:
+        raise HTTPException(400, msg_id)
+    return {"subject": subject, "body": body, "sent": True, "message_id": msg_id}
+
+
+# ── Gmail OAuth ───────────────────────────────────────────────────────────────
+
+@app.get("/gmail/connect-link")
+async def gmail_connect_link(telegram_id: int = Query(...)):
     try:
-        llm_text = await openclaw_client.complete(system, user)
-        subject, body = _split_subject_and_body(llm_text)
-    except Exception:
-        subject, body = _fallback_outreach_draft(
-            recipient_name=payload.recipient_name,
-            role=payload.role,
-            company=payload.company,
-            resume_text=payload.resume_text,
-        )
-
-    body = _finalize_outreach_body(body, payload.sender_full_name)
-
-    if not payload.send_now:
-        return OutreachEmailResponse(
-            subject=subject,
-            body=body,
-            sent=False,
-            message_id=None,
-            status="Draft generated. Set send_now=true to send via Gmail API.",
-        )
-
-    if not payload.resume_file_base64:
-        raise HTTPException(
-            status_code=400,
-            detail="resume_file_base64 is required when send_now=true. Please upload a resume PDF.",
-        )
-
-    connected, _ = gmail_oauth_service.get_status(payload.telegram_user_id)
-    if not connected:
-        connect_url = gmail_oauth_service.get_connect_url(payload.telegram_user_id)
-        return OutreachEmailResponse(
-            subject=subject,
-            body=body,
-            sent=False,
-            message_id=None,
-            status="Gmail is not connected for this user. Connect Gmail first, then send again.",
-            connect_url=connect_url,
-        )
-
-    try:
-        attachment_bytes: Optional[bytes] = None
-        attachment_filename: Optional[str] = None
-        if payload.resume_file_base64:
-            try:
-                attachment_bytes = base64.b64decode(payload.resume_file_base64)
-                attachment_filename = payload.resume_filename or "resume.pdf"
-            except (binascii.Error, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=f"Invalid resume_file_base64 payload: {exc}") from exc
-
-        sent, message_id, status = await asyncio.to_thread(
-            gmail_service.send_email,
-            payload.telegram_user_id,
-            payload.to_email,
-            subject,
-            body,
-            attachment_filename,
-            attachment_bytes,
-        )
-        return OutreachEmailResponse(
-            subject=subject,
-            body=body,
-            sent=sent,
-            message_id=message_id,
-            status=status,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to send outreach email: {exc}") from exc
+        url = gmail_service.get_auth_url(telegram_id)
+        return {"connect_url": url}
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
 
-@app.get("/gmail/connect-link", response_model=GmailConnectLinkResponse)
-async def gmail_connect_link(telegram_user_id: int = Query(..., ge=1)) -> GmailConnectLinkResponse:
-    try:
-        connect_url = gmail_oauth_service.get_connect_url(telegram_user_id)
-        return GmailConnectLinkResponse(connect_url=connect_url)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+@app.get("/gmail/status/{telegram_id}")
+async def gmail_status(telegram_id: int):
+    connected, email = gmail_service.get_status(telegram_id)
+    return {"connected": connected, "email": email}
 
 
-@app.get("/gmail/status/{telegram_user_id}", response_model=GmailConnectionStatusResponse)
-async def gmail_connection_status(telegram_user_id: int) -> GmailConnectionStatusResponse:
-    connected, sender_email = gmail_oauth_service.get_status(telegram_user_id)
-    return GmailConnectionStatusResponse(connected=connected, sender_email=sender_email)
-
-
-@app.post("/gmail/disconnect", response_model=GmailConnectionStatusResponse)
-async def gmail_disconnect(payload: GmailDisconnectRequest) -> GmailConnectionStatusResponse:
-    gmail_oauth_service.disconnect(payload.telegram_user_id)
-    return GmailConnectionStatusResponse(connected=False, sender_email=None)
+@app.post("/gmail/disconnect/{telegram_id}")
+async def gmail_disconnect(telegram_id: int):
+    gmail_service.disconnect(telegram_id)
+    return {"connected": False}
 
 
 @app.get("/oauth/gmail/callback", response_class=HTMLResponse)
-async def gmail_oauth_callback(code: str, state: str) -> HTMLResponse:
+async def oauth_callback(code: str, state: str):
     try:
-        telegram_user_id, sender_email = await gmail_oauth_service.complete_oauth_callback(code, state)
+        tid, email = await gmail_service.complete_oauth(code, state)
         return HTMLResponse(
-            content=(
-                "<html><body style='font-family: sans-serif; padding: 24px;'>"
-                "<h2>Gmail connected successfully</h2>"
-                f"<p>Telegram user ID: <b>{telegram_user_id}</b></p>"
-                f"<p>Connected Gmail: <b>{sender_email}</b></p>"
-                "<p>You can close this tab and return to Telegram.</p>"
-                "</body></html>"
-            ),
-            status_code=200,
+            f"<h2>✅ Gmail connected!</h2><p>Account: <b>{email}</b></p>"
+            "<p>You can close this tab and return to Telegram.</p>"
         )
-    except Exception as exc:
+    except Exception as e:
         return HTMLResponse(
-            content=(
-                "<html><body style='font-family: sans-serif; padding: 24px;'>"
-                "<h2>Gmail connection failed</h2>"
-                f"<p>{exc}</p>"
-                "<p>Please retry from Telegram.</p>"
-                "</body></html>"
-            ),
+            f"<h2>❌ Connection failed</h2><p>{e}</p>"
+            "<p>Please try again from Telegram.</p>",
             status_code=400,
         )
 
 
-@app.post("/interview/prepare", response_model=LLMResponse)
-async def prepare_interview(payload: InterviewPrepRequest) -> LLMResponse:
-    system = "You are a job interview preparation coach."
-    focus = ", ".join(payload.focus_areas) if payload.focus_areas else "general interview readiness"
-    user = (
-        f"Role: {payload.role}\n"
-        f"Company: {payload.company}\n"
-        f"Focus areas: {focus}\n\n"
-        "Create a practical interview prep plan including:\n"
-        "1) likely questions with strong sample answers\n"
-        "2) technical and behavioral prep checklist\n"
-        "3) 3 smart questions to ask interviewer\n"
-        "4) 24-hour prep timeline"
+# ── Interview ─────────────────────────────────────────────────────────────────
+
+class InterviewPrepRequest(BaseModel):
+    role: str
+    company: str
+    focus_areas: list[str] = []
+
+
+@app.post("/interview/prepare")
+async def interview_prepare(req: InterviewPrepRequest):
+    text = await llm_tasks.interview_prep(req.role, req.company, req.focus_areas)
+    return {"text": text}
+
+
+# ── Applications ──────────────────────────────────────────────────────────────
+
+class AppAddRequest(BaseModel):
+    telegram_id: int
+    company: str
+    role: str
+    status: str = "Applied"
+    url: str = ""
+    notes: str = ""
+    salary: str = ""
+    source: str = ""
+
+
+@app.post("/applications/add")
+async def add_application(req: AppAddRequest):
+    from datetime import date, timedelta
+    followup = str(date.today() + timedelta(days=settings.followup_reminder_days))
+    app_id = db.add_application(
+        req.telegram_id, req.company, req.role, req.status,
+        req.url, req.notes, req.salary, req.source, followup,
     )
-    try:
-        text = await openclaw_client.complete(system, user)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "LLM service is unavailable. Check OPENCLAW_API_URL and make sure the model server is running. "
-                f"({exc})"
-            ),
-        ) from exc
-    return LLMResponse(text=text)
+    return {"id": app_id, "followup_date": followup}
 
 
-@app.post("/notion/track", response_model=TrackJobResponse)
-async def track_job(payload: TrackJobRequest) -> TrackJobResponse:
-    try:
-        message, page_id = await notion_service.track_job(
-            company=payload.company,
-            role=payload.role,
-            status=payload.status,
-            link=payload.link,
-            notes=payload.notes,
-        )
-        return TrackJobResponse(message=message, page_id=page_id)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to track job: {exc}") from exc
+@app.get("/applications/{telegram_id}")
+async def get_applications(telegram_id: int):
+    apps = db.get_applications(telegram_id)
+    return {"applications": apps, "total": len(apps)}
+
+
+class AppUpdateRequest(BaseModel):
+    status: str
+    notes: str = ""
+
+
+@app.post("/applications/update/{app_id}")
+async def update_app(app_id: int, req: AppUpdateRequest):
+    db.update_application_status(app_id, req.status, req.notes)
+    return {"updated": True, "app_id": app_id, "status": req.status}
+
+
+@app.get("/applications/export/{telegram_id}")
+async def export_excel(telegram_id: int):
+    from app.services.excel_tracker import get_workbook_path
+    from fastapi.responses import FileResponse
+    path = get_workbook_path(telegram_id)
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="job_applications.xlsx",
+    )

@@ -1,0 +1,70 @@
+Praveena Vijayan
+Email: praveenavj2210@gmail.com | Singapore PR
+GitHub: github.com/Praveena Vijayan
+LinkedIn: linkedin.com/in/praveena-vijayan-11099a157/
+
+EDUCATION
+Nanyang Technological University, Singapore (Aug 2022 – May 2026)
+Bachelor of Engineering (Computer Science)
+Relevant modules: Data Structures & Algorithms, Data Science & AI, Database System Principles,
+Data Analytics & Mining, Algorithm Design & Analysis, Digital Logic, Computing & Programming.
+
+Ngee Ann Polytechnic, Singapore (May 2019 – July 2022)
+Diploma in Aerospace Engineering
+- Academic Achievement Award, Oct 2019 semester
+- Director's List Semester 1.2
+
+WORK EXPERIENCE
+Skyworks Solutions — Automation Engineer Intern (Software) | Jan 2024 – Present
+- Building Power BI dashboards published to Power BI Service for cross-functional reporting
+- Automating visual inspection of wafers using AI models to classify defects per layer
+- Extending existing web applications with new features using React and NodeJS
+
+Science Centre Singapore — Data Analytics & Digital Marketing Intern | May 2023 – Oct 2023
+- Data cleaning, manipulation, and visualization using Qlik Sense for performance tracking dashboards
+- Acted as Business Analyst in New Ticketing Platform (NTP) project; crafted user stories using agile
+- Conducted RFM analysis to segment customers into 3 tiers and developed conversion strategies
+- Contributed to visitor behaviour analysis and customer journey enhancement
+
+SembCorp Marine Ltd — Associate Software Engineer (Full-time) | May 2022 – July 2022
+- Built responsive web interfaces using HTML, CSS, and JavaScript
+- Collaborated with designers and back-end developers to convert mockups into functional websites
+- Conducted code reviews, optimized codebase, and participated in User Acceptance Testing (UAT)
+
+Textron Aviation — Intern (Full-time) | March 2021 – Aug 2021
+- Initiated projects to reduce defects and waste in warehouse operations; tracked KPIs in Excel
+- Improved incoming parts KPI from 60% to 80% month-over-month
+- Managed delivery and purchase order records via company software
+
+ACADEMIC PROJECTS
+Developing & Designing Databases (Aug 2023 – Dec 2023)
+- Used MySQL to analyse EV vs alternative fuel vehicle datasets with geospatial analysis (geopandas)
+- Applied K-Medoids clustering to identify optimal EV station placement strategies for Singapore
+
+Object-Oriented Programming — CAMs (Aug 2023 – Dec 2023)
+- Built full Camp Application and Management System in Java using SOLID and OOP principles
+- Used Apache POI library (self-learnt) for Excel read/write (xlsx); produced UML and Javadoc docs
+
+Data Science & AI — Diabetes Prediction System (Jan 2023 – May 2023)
+- Processed combined numerical and categorical dataset using KNN imputer for null value handling
+- Applied Logistic Regression, Random Forest, SVM; achieved highest accuracy with Logistic Regression
+
+HACKATHONS & COMPETITIONS
+HackFest 2025 (Grab) — 2nd Runner-Up | Feb–Mar 2025
+- Proposed common collection points and midnight meals to reduce food wastage; modelled 40% and 20% revenue uplift
+
+Product Management Experience 2024 — 3rd Place | Sep–Dec 2024
+- Attended industry-expert workshops; gained hands-on experience in user interviews, A/B testing, PRFAQs
+
+Techfest Hackathon 2024 — MoodTune Chatbot | Feb 2024
+- Integrated OpenAI API for personalised mental health chatbot with voice-to-text, journaling, dashboarding
+
+PSA Code Sprint 2023 — AI Employee Performance Management | Sep–Oct 2023
+- Trained Multinomial Logistic Regression and Neural Network (TensorFlow) to predict performance ratings
+
+TECHNICAL SKILLS
+Languages: Python, Java, JavaScript, HTML/CSS, C/C++/C#, SQL, NoSQL (MongoDB)
+Libraries & Tools: Pandas, Matplotlib, Seaborn, Scikit-Learn, TensorFlow, Geopandas, Power BI,
+                   React, NodeJS, Figma, Lean Six Sigma (Minitab), VBA Excel, Canva
+Soft Skills: Analytical thinking, problem-solving, fast learner, teamwork, detail-oriented, adaptable
+Languages spoken: English, Tamil, Malay
